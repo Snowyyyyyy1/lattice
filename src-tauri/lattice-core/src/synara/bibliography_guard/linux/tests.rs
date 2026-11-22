@@ -4,6 +4,8 @@ use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// The keys Lattice passes in, which the sandbox cannot read from the keyring.
 mod keys;
@@ -80,8 +82,18 @@ impl Sandbox {
         Self::with_runtime(&runtime_folders())
     }
 
+    /// The sandbox over a filter that keeps a single descriptor of the
+    /// files looked up open, so that every operation opens its file again.
+    fn keeping_one_open() -> Self {
+        Self::mounted(&runtime_folders(), Some(1))
+    }
+
     /// The sandbox for a user whose runtime folders are `runtime`.
     fn with_runtime(runtime: &[PathBuf]) -> Self {
+        Self::mounted(runtime, None)
+    }
+
+    fn mounted(runtime: &[PathBuf], open: Option<usize>) -> Self {
         let app_data = TempDir::new("bib-guard-app");
         let home = fs::canonicalize(&app_data).unwrap().join("synara");
         fs::create_dir(&home).unwrap();
@@ -90,7 +102,11 @@ impl Sandbox {
         fs::create_dir(&options).unwrap();
         fs::write(options.join("options.json"), "{}").unwrap();
         let mountpoint = Mountpoint::create_in(&home.join(MOUNTS)).expect("the filter's folder");
-        let filter = name_filter::mount(Path::new("/"), &mountpoint.0).expect("mount the filter");
+        let filter = match open {
+            Some(open) => name_filter::mount_keeping(Path::new("/"), &mountpoint.0, open),
+            None => name_filter::mount(Path::new("/"), &mountpoint.0),
+        }
+        .expect("mount the filter");
         Self {
             _filter: filter,
             mountpoint,
@@ -261,10 +277,14 @@ fn a_file_opened_before_a_rename_onto_a_bibliography_cannot_change_it() {
     if !guard_available() {
         return;
     }
+    rename_onto_a_bibliography(Sandbox::new());
+    rename_onto_a_bibliography(Sandbox::keeping_one_open());
+}
+
+fn rename_onto_a_bibliography(sandbox: Sandbox) {
     let root = Guarded::new();
     let bibliography = root.write("references.bib", "original");
     let (draft, other) = (root.write("draft.txt", "draft"), root.write("other.txt", "other"));
-    let sandbox = Sandbox::new();
     let file = fs::OpenOptions::new().read(true).write(true).open(sandbox.through(&draft)).unwrap();
     let source = fs::File::open(sandbox.through(&other)).unwrap();
     let fd = file.as_raw_fd();
@@ -313,18 +333,21 @@ fn refused(result: &io::Result<()>) -> bool {
 
 /// A second name a bibliography had before the sandbox started, written
 /// without ever looking the `.bib` name up, which would tell the filter.
+/// With one descriptor kept open as well, so the file is opened again by
+/// name each time and the rule still holds then.
 #[test]
 fn a_second_name_made_before_the_sandbox_cannot_change_a_bibliography() {
     if !guard_available() {
         return;
     }
-    let root = Guarded::new();
-    let bibliography = root.write("references.bib", "original");
-    let prelinked = root.0.join("prelinked.txt");
-    fs::hard_link(&bibliography, &prelinked).unwrap();
-    let sandbox = Sandbox::new();
-    assert!(!sandbox.run("printf changed >> \"$1\"", &[&prelinked]));
-    assert_eq!(fs::read_to_string(&bibliography).unwrap(), "original");
+    for sandbox in [Sandbox::new(), Sandbox::keeping_one_open()] {
+        let root = Guarded::new();
+        let bibliography = root.write("references.bib", "original");
+        let prelinked = root.0.join("prelinked.txt");
+        fs::hard_link(&bibliography, &prelinked).unwrap();
+        assert!(!sandbox.run("printf changed >> \"$1\"", &[&prelinked]));
+        assert_eq!(fs::read_to_string(&bibliography).unwrap(), "original");
+    }
 }
 
 /// The broker writes a bibliography through a temporary beside it and
@@ -459,4 +482,182 @@ fn the_sandbox_has_its_own_session_and_stops_on_its_sigterm() {
     // SAFETY: `kill` takes and returns plain integers.
     unsafe { libc::kill(-leader, libc::SIGTERM) };
     assert_eq!(command.wait().unwrap().code(), Some(7));
+}
+
+/// What the filter's process may have open in [`a_walk_through_the_filter_leaves_it_descriptors_to_spare`],
+/// far fewer than the files walked.
+const WALK_LIMIT: libc::rlim_t = 256;
+/// Set for the copy of this test binary that serves the walked tree.
+const WALKED: &str = "LATTICE_TEST_WALKED_TREE";
+/// The file in the walked tree that copy names the filter's mount point
+/// in, once it is mounted: a file in the tree's top folder, which the walk
+/// passes over.
+const MOUNTED_AT: &str = "mounted-at";
+
+/// A walk over the filter's mount, as a `du` outside the sandbox made
+/// (lattice#1221), took a descriptor for each file it passed and kept it,
+/// until the filter's process had none left: the mount stopped, and the
+/// program in the sandbox failed to open and close its own files. Under a
+/// low limit, the walk passes many more files than that limit, the filter's
+/// count stays well below it, and the program inside keeps working.
+#[test]
+fn a_walk_through_the_filter_leaves_it_descriptors_to_spare() {
+    if let Some(tree) = std::env::var_os(WALKED) {
+        return serve_walked_tree(Path::new(&tree));
+    }
+    if !guard_available() {
+        return;
+    }
+    let tree = Guarded::new();
+    let (folders, files) = (20, 100);
+    for folder in 0..folders {
+        for file in 0..files {
+            tree.write(&format!("{folder}/{file}"), "x");
+        }
+    }
+    let module = module_path!().split_once("::").map_or(module_path!(), |(_, path)| path);
+    let name = format!("{module}::a_walk_through_the_filter_leaves_it_descriptors_to_spare");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(WALKED, &tree.0)
+        .stdin(Stdio::null())
+        .process_group(0);
+    let mut guard = Served(command.spawn().expect("start the filter's process"));
+    let pid = guard.0.id();
+    let started = std::time::Instant::now();
+    let report = tree.0.join(MOUNTED_AT);
+    let mountpoint = loop {
+        if let Ok(path) = fs::read_to_string(&report) {
+            break PathBuf::from(path);
+        }
+        if started.elapsed() > WALK_DEADLINE {
+            panic!("the filter was not mounted in time\n{}", served_state(pid));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    // Nothing outside lists its way into the mount.
+    // SAFETY: `geteuid` takes and returns plain integers.
+    if unsafe { libc::geteuid() } != 0 {
+        let listed = fs::read_dir(mountpoint.parent().unwrap()).map(|_| ());
+        assert_eq!(listed.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    // On a thread of its own: a walk that hangs in the filter is ended by
+    // ending the filter's process, which fails it.
+    let passed = Arc::new(AtomicUsize::new(0));
+    let walked = mountpoint.join(tree.0.strip_prefix("/").unwrap());
+    let walking = {
+        let passed = Arc::clone(&passed);
+        thread::spawn(move || -> io::Result<usize> {
+            let descriptors = || fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, Iterator::count);
+            let mut most = descriptors();
+            for folder in fs::read_dir(walked)? {
+                let folder = folder?.path();
+                if !folder.is_dir() {
+                    continue;
+                }
+                for file in fs::read_dir(&folder)? {
+                    fs::symlink_metadata(file?.path())?;
+                    if passed.fetch_add(1, Ordering::Relaxed).is_multiple_of(25) {
+                        most = most.max(descriptors());
+                    }
+                }
+            }
+            Ok(most)
+        })
+    };
+    let started = std::time::Instant::now();
+    while !walking.is_finished() {
+        if started.elapsed() > WALK_DEADLINE {
+            panic!(
+                "the walk stopped after {} files\n{}",
+                passed.load(Ordering::Relaxed),
+                served_state(pid)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let most = walking.join().unwrap().expect("walk the tree through the filter");
+    fs::write(tree.0.join("stop"), "").unwrap();
+    let status = loop {
+        if let Some(status) = guard.0.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > 2 * WALK_DEADLINE {
+            panic!("the filter's process did not end\n{}", served_state(pid));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(passed.load(Ordering::Relaxed), folders * files);
+    assert!(
+        most < WALK_LIMIT as usize / 2,
+        "the filter had {most} descriptors open for a walk of {folders}×{files} files"
+    );
+    assert!(status.success(), "the program in the sandbox failed during the walk");
+}
+
+/// How long each part of that test may take, far longer than it does.
+const WALK_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The filter's process in that test, ended with everything it started
+/// when the test ends, however it ends.
+struct Served(std::process::Child);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        // SAFETY: `kill` takes and returns plain integers; the group is the
+        // process's own (`process_group(0)`), not yet waited for here.
+        unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = self.0.wait();
+    }
+}
+
+/// What the filter's process `pid` and its threads are doing, for a
+/// failure that has to say where it hung.
+fn served_state(pid: u32) -> String {
+    let read = |path: String| fs::read_to_string(path).unwrap_or_default();
+    let mut state = format!(
+        "descriptors: {}\n",
+        fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, Iterator::count)
+    );
+    for task in fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten() {
+        let task = task.path().display().to_string();
+        state += &format!(
+            "{} {} wchan={} stack={}\n",
+            task,
+            read(format!("{task}/comm")).trim(),
+            read(format!("{task}/wchan")),
+            read(format!("{task}/stack")).replace('\n', " | "),
+        );
+    }
+    state
+}
+
+/// The other side of that test: the filter, under [`WALK_LIMIT`], and a
+/// program in the sandbox that opens and closes a file of `tree` until
+/// the walk is over.
+fn serve_walked_tree(tree: &Path) {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `limit` is an rlimit the calls read and write.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = WALK_LIMIT.min(limit.rlim_max);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+    let sandbox = Sandbox::new();
+    let report = tree.join(MOUNTED_AT);
+    let partial = tree.join(format!("{MOUNTED_AT}.partial"));
+    fs::write(&partial, sandbox.mountpoint.0.as_os_str().as_bytes()).unwrap();
+    fs::rename(&partial, &report).unwrap();
+    eprintln!("walk test: the filter is mounted, under a limit of {}", limit.rlim_cur);
+    let script = "opened=0; \
+         while [ ! -e \"$1/stop\" ]; do \
+           cat \"$1/0/0\" > /dev/null || exit 1; opened=$((opened + 1)); \
+         done; \
+         [ \"$opened\" -gt 0 ]";
+    let status = sandbox.command(script).arg(tree).status().expect("run sandboxed command");
+    eprintln!("walk test: the program in the sandbox ended with {status}");
+    assert!(status.success(), "the program in the sandbox could not open and close a file");
 }
