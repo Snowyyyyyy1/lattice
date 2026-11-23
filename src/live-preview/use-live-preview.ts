@@ -18,6 +18,7 @@
  * minutes ends that: the pill says why, and clicking it starts over.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { t } from "@lingui/core/macro";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { ProjectSnapshot } from "../app-types";
 import { hostErrorMessage } from "../app-utils";
@@ -82,6 +83,7 @@ export function useLivePreview({ project, activeFile, source, savedSource }: {
 
   const active = Boolean(root && available && enabled && mainFile);
   const runKey = active ? `${root}\n${mainFile}\n${attempt}` : "";
+  const runKeyRef = useLatestRef(runKey);
   const state = useMemo<LivePreviewState>(
     () => (!active ? OFF : run.key === runKey ? run.state : STARTING),
     [active, run, runKey],
@@ -170,6 +172,25 @@ export function useLivePreview({ project, activeFile, source, savedSource }: {
     restarts.current.at.length = 0;
     setAttempt((count) => count + 1);
   }, []);
+  /**
+   * Delete rtex and its build folders and start again, which downloads it
+   * afresh: what a first layout that never comes offers. Live preview stays
+   * on.
+   */
+  const reinstall = useCallback(async () => {
+    try {
+      // The host stops every rtex first and waits for it to be gone.
+      await invoke<LivePreviewInstall>("live_preview_remove");
+    } catch (reason) {
+      // A download still under way, or files macOS would not delete: say
+      // so, rather than start the same rtex again.
+      const error = hostErrorMessage(reason);
+      setRun({ key: runKeyRef.current, state: { kind: "failed", message: t`Could not reinstall live preview: ${error}` } });
+      return;
+    }
+    restarts.current.at.length = 0;
+    setAttempt((count) => count + 1);
+  }, [runKeyRef]);
   /** Turn live preview off everywhere and delete rtex and its build folders. */
   const remove = useCallback(async () => {
     disableLivePreviewEverywhere();
@@ -180,8 +201,8 @@ export function useLivePreview({ project, activeFile, source, savedSource }: {
   // One identity while nothing here changes: the PDF panel and Settings take
   // it, and typing re-renders App on every keystroke.
   return useMemo(
-    () => ({ available, enabled, state, setEnabled, retry, remove, buildHooks }),
-    [available, enabled, remove, retry, setEnabled, state],
+    () => ({ available, enabled, state, setEnabled, retry, reinstall, remove, buildHooks }),
+    [available, enabled, reinstall, remove, retry, setEnabled, state],
   );
 }
 
