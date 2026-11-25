@@ -444,21 +444,21 @@ impl PdfView {
 
     /// The digest of the PDF on screen, which changes once a rebuild's bytes
     /// are loaded, for a scenario timing an edit to its pages.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn shown_digest(&self) -> Option<&str> {
         self.shown_digest.as_deref()
     }
 
     /// How many times a PDF was read into this viewer, for a scenario
     /// counting the reads an entry or a build costs.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn opens(&self) -> usize {
         self.opens
     }
 
     /// Whether the viewer shows nothing, nor is loading anything: its empty
     /// state ("No PDF yet").
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn is_empty(&self) -> bool {
         self.document.is_none() && !self.loading && self.message.is_none()
     }
@@ -707,7 +707,7 @@ impl PdfView {
     }
 
     /// Leave fit mode at the scale it gave, as a zoom does, for a scenario.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn clear_fit(&mut self, cx: &mut Context<Self>) {
         self.fit = None;
         self.remember_view();

@@ -11,12 +11,21 @@
 //! are in the image as they show. GPUI's own `render_to_image` draws only
 //! GPUI's scene and never a page, so it could not show a menu hidden under
 //! one.
+//!
+//! On Linux the window is read back from the X server
+//! (`native::capture_client`): gpui_linux has no `render_to_image` at the
+//! gpui-fast pin, so the window must be mapped, as it is on the runner's Xvfb
+//! display. What lavapipe presents reads back black there, so the e2e job
+//! draws through GL (gpui.yml).
 
 use anyhow::Result;
 use gpui::AsyncApp;
 
 use super::Run;
-#[cfg(all(target_os = "macos", feature = "offscreen-shots"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "offscreen-shots"),
+    target_os = "linux"
+))]
 use super::sleep;
 
 impl Run {
@@ -70,6 +79,18 @@ impl Run {
     #[cfg(target_os = "windows")]
     pub(super) async fn capture(&self, cx: &mut AsyncApp, out: &str) -> Result<()> {
         crate::native::capture_client(self.native(cx)?)?.save(out)?;
+        Ok(())
+    }
+
+    /// GPUI draws a mapped window on its own clock, so the frame a change
+    /// asked for is requested and given a few frames to reach the server.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn capture(&self, cx: &mut AsyncApp, out: &str) -> Result<()> {
+        let native = self.native(cx)?;
+        crate::native::order_front(native);
+        self.with_window(cx, |_, window, _| window.refresh())?;
+        sleep(cx, std::time::Duration::from_millis(300)).await;
+        crate::native::capture_client(native)?.save(out)?;
         Ok(())
     }
 }
